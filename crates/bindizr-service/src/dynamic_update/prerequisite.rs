@@ -2,12 +2,13 @@
 //! before any update is applied. Zone-class records are grouped by name and type
 //! and must equal the zone's record set there (Section 3.2.3).
 
-use bindizr_core::dns::name::OwnerName;
+use bindizr_core::dns::{message::Rtype, name::OwnerName};
 use bindizr_db::LockLevel;
 
 use super::{DynamicUpdateError, Prerequisite, parse_update_owner};
 use crate::{
     Transaction,
+    error::ServiceError,
     model::{
         record::{Record, RecordType},
         zone::Zone,
@@ -62,6 +63,40 @@ pub(crate) async fn evaluate_prerequisites_tx(
                     return Err(DynamicUpdateError::YxRrset(format!(
                         "{} records at {} exist",
                         record_type, owner
+                    )));
+                }
+            }
+            Prerequisite::UnstoredTypeInUse { name, record_type } => {
+                let owner = parse_update_owner(name, &zone.name)?;
+                // The SOA is no row, but the zone's own stands at the apex.
+                if !(*record_type == Rtype::SOA && owner.is_apex()) {
+                    return Err(DynamicUpdateError::NxRrset(format!(
+                        "no {} records at {}",
+                        record_type, owner
+                    )));
+                }
+            }
+            Prerequisite::UnstoredTypeNotInUse { name, record_type } => {
+                let owner = parse_update_owner(name, &zone.name)?;
+                if *record_type == Rtype::SOA && owner.is_apex() {
+                    return Err(DynamicUpdateError::YxRrset(format!(
+                        "SOA records at {} exist",
+                        owner
+                    )));
+                }
+            }
+            Prerequisite::SoaInUse { name, rdata } => {
+                let owner = parse_update_owner(name, &zone.name)?;
+                let served = zone.soa_rdata(zone.serial).map_err(|e| {
+                    DynamicUpdateError::Internal(ServiceError::internal_with_source(
+                        "failed to encode the zone's SOA",
+                        e,
+                    ))
+                })?;
+                if !owner.is_apex() || served != *rdata {
+                    return Err(DynamicUpdateError::NxRrset(format!(
+                        "SOA records at {} are not the ones the prerequisite names",
+                        owner
                     )));
                 }
             }

@@ -2,33 +2,28 @@
 //! Prerequisite evaluation, per-key authorization, and the transactional apply
 //! live here; the DNS front end owns the message format, TSIG, and rdata.
 
-use bindizr_db::LockLevel;
-
+mod operation;
 mod prerequisite;
 
 use bindizr_core::{
     dns::{
-        Serial, Ttl,
+        Serial,
+        message::Rtype,
         name::{OwnerName, ParseNameError, ZoneName, to_fqdn},
+        record::Rdata,
     },
-    model::{
-        record::RecordId,
-        role_grant::{Action, RoleGrants},
-    },
+    model::role_grant::{Action, RoleGrants},
 };
-use chrono::Utc;
+use bindizr_db::LockLevel;
+pub use operation::UpdateOperation;
+use operation::apply_op_tx;
 use prerequisite::evaluate_prerequisites_tx;
 use thiserror::Error;
 
 use crate::{
     Context, Transaction, dnssec,
     error::ServiceError,
-    model::{
-        record::{Record, RecordType},
-        tsig_key::TsigKey,
-        zone::Zone,
-    },
-    record::{self, AddResult},
+    model::{record::RecordType, tsig_key::TsigKey, zone::Zone},
     serial::generate_serial,
     transaction,
     zone::{self, version::ChangeAttribution},
@@ -48,6 +43,11 @@ pub enum DynamicUpdateError {
     NxDomain(String),
     #[error("{0}")]
     NxRrset(String),
+    /// The zone section names a zone this server does not serve (RFC 2136,
+    /// Section 3.1.2).
+    #[error("{0}")]
+    NotAuth(String),
+    /// An owner name lies outside the zone the request named.
     #[error("{0}")]
     NotZone(String),
     /// A fault of the server's own, kept beneath: SERVFAIL.
@@ -103,63 +103,15 @@ pub enum Prerequisite {
         value: String,
         priority: Option<i32>,
     },
-}
-
-/// One update to apply (RFC 2136, Section 2.5). Owner names are absolute.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpdateOperation {
-    /// CLASS IN: add the record.
-    AddRecord {
-        name: String,
-        record_type: RecordType,
-        /// TXT arrives row-encoded; every other type in presentation form.
-        value: String,
-        ttl: Ttl,
-        priority: Option<i32>,
-    },
-    /// CLASS ANY: delete a record set, or every record set at the owner name when
-    /// `record_type` is `None` (wire TYPE ANY).
-    DeleteRecordSet {
-        name: String,
-        record_type: Option<RecordType>,
-    },
-    /// CLASS NONE: delete the records carrying exactly this rdata.
-    DeleteRecord {
-        name: String,
-        record_type: RecordType,
-        value: String,
-        priority: Option<i32>,
-    },
-}
-
-impl UpdateOperation {
-    /// The grant action this operation needs: an add creates, both deletes delete.
-    fn action(&self) -> Action {
-        match self {
-            UpdateOperation::AddRecord { .. } => Action::RecordCreate,
-            UpdateOperation::DeleteRecordSet { .. } | UpdateOperation::DeleteRecord { .. } => {
-                Action::RecordDelete
-            }
-        }
-    }
-
-    /// Return the owner name targeted by this update operation.
-    fn name(&self) -> &str {
-        match self {
-            UpdateOperation::AddRecord { name, .. }
-            | UpdateOperation::DeleteRecordSet { name, .. }
-            | UpdateOperation::DeleteRecord { name, .. } => name,
-        }
-    }
-
-    /// The type this update touches; `None` for a whole-name delete.
-    fn record_type(&self) -> Option<&RecordType> {
-        match self {
-            UpdateOperation::AddRecord { record_type, .. }
-            | UpdateOperation::DeleteRecord { record_type, .. } => Some(record_type),
-            UpdateOperation::DeleteRecordSet { record_type, .. } => record_type.as_ref(),
-        }
-    }
+    /// A record set of a type bindizr never stores must exist: it cannot,
+    /// the zone's own SOA at the apex excepted.
+    UnstoredTypeInUse { name: String, record_type: Rtype },
+    /// A record set of a type bindizr never stores must not exist: it never
+    /// does, the zone's own SOA at the apex excepted.
+    UnstoredTypeNotInUse { name: String, record_type: Rtype },
+    /// CLASS IN, TYPE SOA: the zone's SOA must carry exactly this rdata
+    /// (RFC 2136, Section 3.2.3).
+    SoaInUse { name: String, rdata: Rdata },
 }
 
 /// A decoded UPDATE message: the zone it targets, the key that signed it, and
@@ -183,7 +135,10 @@ pub async fn apply(cx: &Context, update: DynamicUpdate) -> Result<bool, DynamicU
         let zone = zone::find_served_by_name_tx(&mut tx, &update.zone_name, LockLevel::Exclusive)
             .await?
             .ok_or_else(|| {
-                DynamicUpdateError::NotZone(format!("zone '{}' not found", update.zone_name))
+                DynamicUpdateError::NotAuth(format!(
+                    "zone '{}' is not served here",
+                    update.zone_name
+                ))
             })?;
 
         authorize_key_tx(
@@ -288,7 +243,11 @@ async fn authorize_key_tx(
     // is evaluated, ahead of where RFC 2136, Section 3.3 puts permissions.
     for prerequisite in prerequisites {
         let (name, record_type) = match prerequisite {
-            Prerequisite::NameInUse { name } | Prerequisite::NameNotInUse { name } => (name, None),
+            Prerequisite::NameInUse { name }
+            | Prerequisite::NameNotInUse { name }
+            | Prerequisite::UnstoredTypeInUse { name, .. }
+            | Prerequisite::UnstoredTypeNotInUse { name, .. }
+            | Prerequisite::SoaInUse { name, .. } => (name, None),
             Prerequisite::RecordSetInUse { name, record_type }
             | Prerequisite::RecordSetNotInUse { name, record_type }
             | Prerequisite::RecordInUse {
@@ -321,120 +280,6 @@ async fn authorize_key_tx(
     }
 
     Ok(())
-}
-
-/// Apply one authorized dynamic update operation in the current transaction.
-async fn apply_op_tx(
-    tx: &mut Transaction<'_>,
-    zone: &Zone,
-    op: &UpdateOperation,
-    new_serial: Serial,
-) -> Result<bool, DynamicUpdateError> {
-    match op {
-        UpdateOperation::AddRecord {
-            name,
-            record_type,
-            value,
-            ttl,
-            priority,
-        } => {
-            let owner = parse_update_owner(name, &zone.name)?;
-
-            // Row-encode so nsupdate stores the same spelling as the other write
-            // paths; TXT arrives already encoded from the wire rdata.
-            let value = if *record_type == RecordType::Txt {
-                value.to_string()
-            } else {
-                record_type.encoded_value(value, *priority).map_err(|e| {
-                    DynamicUpdateError::Refused(format!(
-                        "invalid {} rdata: {}",
-                        record_type.as_str(),
-                        e
-                    ))
-                })?
-            };
-
-            let outcome =
-                record::validate_add_tx(tx, zone, &owner, record_type, &value, *ttl, *priority)
-                    .await?;
-
-            // RFC 2136, Section 3.4.2.2: an rdata-identical add is a silent no-op. The
-            // TTL-replace clause is not implemented; record set TTLs change via the API.
-            if matches!(outcome, AddResult::Duplicate) {
-                return Ok(false);
-            }
-
-            record::create_with_changes_tx(
-                tx,
-                zone.id,
-                new_serial,
-                &[Record {
-                    id: RecordId::UNWRITTEN,
-                    name: owner,
-                    value,
-                    ttl: *ttl,
-                    priority: record_type.stored_priority(*priority),
-                    record_type: *record_type,
-                    zone_id: zone.id,
-                    created_at: Utc::now(),
-                }],
-            )
-            .await?;
-
-            Ok(true)
-        }
-        UpdateOperation::DeleteRecordSet { name, record_type } => {
-            delete_matching_tx(tx, zone, name, record_type.as_ref(), None, None, new_serial).await
-        }
-        UpdateOperation::DeleteRecord {
-            name,
-            record_type,
-            value,
-            priority,
-        } => {
-            delete_matching_tx(
-                tx,
-                zone,
-                name,
-                Some(record_type),
-                Some(value.as_str()),
-                *priority,
-                new_serial,
-            )
-            .await
-        }
-    }
-}
-
-/// Delete every record at `name` matching the given type and (optionally)
-/// rdata. `record_type` is `None` for a whole-name delete.
-async fn delete_matching_tx(
-    tx: &mut Transaction<'_>,
-    zone: &Zone,
-    name: &str,
-    record_type: Option<&RecordType>,
-    value: Option<&str>,
-    priority: Option<i32>,
-    new_serial: Serial,
-) -> Result<bool, DynamicUpdateError> {
-    let owner = parse_update_owner(name, &zone.name)?;
-    // Only records at the owner name can match, so lock just those.
-    let owner_records =
-        bindizr_db::record::list_by_name_tx(tx, zone.id, &owner, LockLevel::Exclusive).await?;
-
-    let matched: Vec<Record> = owner_records
-        .iter()
-        .filter(|record| record.matches(record_type, value, priority))
-        .cloned()
-        .collect();
-
-    if matched.is_empty() {
-        return Ok(false);
-    }
-
-    record::delete_with_changes_tx(tx, zone.id, new_serial, &matched).await?;
-
-    Ok(true)
 }
 
 /// The owner of an update record. The wire carries owners absolutely, so a name

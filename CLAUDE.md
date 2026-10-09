@@ -514,8 +514,8 @@ arrives by `zone::normalize_name`, which owns the request-phrased rejection
 (`INVALID_ZONE_FIELD`; the root and a wildcard refused): an HTTP path or
 query parameter in its handler, a socket command in its handler, a transfer
 question in the DNS server once the catalog check has passed, where a name
-the type refuses is answered NOTAUTH like a missing zone (an nsupdate says
-NOTZONE), since no stored zone can match it. A name inside a request body
+the type refuses is answered NOTAUTH like a missing zone (an nsupdate too,
+RFC 2136, Section 3.1.2), since no stored zone can match it. A name inside a request body
 or a listing filter is parsed by the service function that takes that
 payload, since the payload is its argument. Everything beneath —
 the `_tx` lookups, the NOTIFY and probe clients, the zone-file parser, the
@@ -528,6 +528,21 @@ refusal may come before any parse: a name no zone can carry leaves no row.
 Two escapes are unrelated to names and own their own encoding: the SOA RNAME
 (`SoaMailbox`, from the admin email) and the TXT value (`TxtRecordValue`,
 raw rdata).
+
+### Protocol behavior follows the RFC
+
+The DNS plane implements the RFCs it cites (1034/1035, 1982, 1995, 1996,
+2136, 2181, 4034/4035, 5155, 5936, 6672, 6891, 7766, 8945, 9103, 9432), and a
+requirement one states is met as written: a MUST is implemented, a SHOULD
+is followed unless the reason not to stands in a comment beside the code,
+and a MAY is a design choice recorded here or in the docs. Interoperability
+with a named server never loosens a MUST by default; where a server needs
+one relaxed, that is an operator option documented with the section and the
+server. The access-control model and the clean-install policy shape *how* a
+requirement is met, not *whether*: XoT admits a request only when its TSIG
+key and its registered address both pass (RFC 9103, Section 7.5), though
+the plain listener takes either alone. Code that meets a requirement cites
+the section (`RFC 9103, Section 7.1`), so a reader can check the text.
 
 ### Clean installs only — no migrations or back-compat
 
@@ -1066,6 +1081,22 @@ than being argued over; `mod.rs` then declares it as `#[cfg(test)] mod tests;`
 and the file imports its parent with `use super::*;`; rustfmt orders it beside
 the other imports. Apply the same threshold after deletions: below 100 lines,
 including the enclosing module braces, return the tests inline.
+
+A module's body — its lines outside `#[cfg(test)]` — splits into files when
+two things hold at once: it has passed **500 lines**, and it decomposes into
+peers of one kind, each complete with its own logic, which the files are
+then named for — the record types (`dns/record/a.rs`, `aaaa.rs`, `cname.rs`),
+the backends (`db/mysql/`, `postgres/`, `sqlite/`), the verbs of an entity
+(`zone/create.rs`, `get.rs`), the listeners (`dns/tcp.rs`, `udp.rs`), the
+subcommand groups of a CLI command (`zone/version.rs`), the route groups of
+a resource, the sections of a protocol message
+(`dynamic_update/prerequisite.rs`, `operation.rs`). The split takes every
+peer, not one pulled out of the rest, and never cuts a function, a type's
+`impl`s, or a `match`. Length alone splits nothing: a long file whose body
+is one type with its impls (`ServiceError`, `Metrics`), one sequenced flow
+(the zone-file reconcile in `record/import`), or a series of declarations
+that carry no logic of their own (the rows of `cli/output/table.rs`) has no
+peers and stays whole.
 
 ### Visibility follows the interface contract
 
